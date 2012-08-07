@@ -72,7 +72,8 @@ static int patestCallback( const void *inputBuffer, void *outputBuffer,
                             void *userData )
 {
     paTestData *data = (paTestData*)userData;
-    float *out = (float*)outputBuffer;
+    //float *out = (float*)outputBuffer;
+    short *out = (short*)outputBuffer;
     unsigned long i;
 
     (void) timeInfo; /* Prevent unused variable warnings. */
@@ -81,8 +82,8 @@ static int patestCallback( const void *inputBuffer, void *outputBuffer,
     
     for( i=0; i<framesPerBuffer; i++ )
     {
-        *out++ = data->sine[data->left_phase];  /* left */
-        *out++ = data->sine[data->right_phase];  /* right */
+        *out++ = data->sine[data->left_phase] * SHRT_MAX;  /* left */
+        *out++ = data->sine[data->right_phase] * SHRT_MAX;  /* right */
         data->left_phase += 1;
         if( data->left_phase >= TABLE_SIZE ) data->left_phase -= TABLE_SIZE;
         data->right_phase += 3; /* higher pitch so we can distinguish left and right. */
@@ -190,7 +191,7 @@ static int engine_init_display(struct engine* engine) {
         return -1;
     }
     outputParameters.channelCount = 2;       /* stereo output */
-    outputParameters.sampleFormat = paFloat32; /* 32 bit floating point output */
+    outputParameters.sampleFormat = paInt16; /* 32 bit floating point output */
     outputParameters.suggestedLatency = Pa_GetDeviceInfo( outputParameters.device )->defaultLowOutputLatency;
     outputParameters.hostApiSpecificStreamInfo = NULL;
 

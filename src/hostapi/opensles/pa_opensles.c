@@ -60,10 +60,11 @@
 #include <SLES/OpenSLES.h>
 #include <SLES/OpenSLES_Android.h>
 #include "pa_debugprint.h"
- 
-//#define LOGI(...)  Pa_Log ((void)__android_log_print(ANDROID_LOG_INFO, "portaudio", __VA_ARGS__))
-//#define TRACE(...) //LOGI(__FILE__ "("QUOTE(__LINE__)"): " __VA_ARGS__ )
 
+#define TRUE    1
+#define FALSE   0
+ 
+#define LOG PaUtil_DebugPrint
 // PA_LOGAPI
 
 /* prototypes for functions declared in this file */
@@ -78,6 +79,26 @@ PaError PaOpenSLES_Initialize( PaUtilHostApiRepresentation **hostApi, PaHostApiI
 #ifdef __cplusplus
 }
 #endif /* __cplusplus */
+
+
+#define CHECK(condition) do{ if (!(condition)) { CHECK_IMPL(__FILE__, __LINE__, __func__, #condition " Assertion failed\n"); raise(SIGTRAP); } } while(0)
+#include <stdarg.h>
+#include <string.h>
+#include <stdio.h>
+#include <signal.h>
+
+static void CHECK_IMPL(const char* file, unsigned long line, const char *function, const char *format, ... )
+{
+	char buffer[512];
+	snprintf(buffer, sizeof(buffer), "[%s(%lu) | %s] ", file, line, function);
+	size_t len = strlen(buffer);
+	va_list args;
+    va_start( args, format );
+	vsnprintf(&buffer[len], sizeof(buffer)-len, format, args );
+    va_end( args );
+
+	PaUtil_DebugPrint(buffer);
+}
 
 
 static void Terminate( struct PaUtilHostApiRepresentation *hostApi );
@@ -360,8 +381,7 @@ static int BuildSLDataFormat(SLDataFormat_PCM *slFormat, int numChannels, PaSamp
 {
     memset(slFormat, 0, sizeof(SLDataFormat_PCM));
     slFormat->formatType    = SL_DATAFORMAT_PCM;
-    slFormat->numChannels   = (SLuint32)numChannels;
-    slFormat->samplesPerSec = (SLuint32)sampleRate * 10000;
+    slFormat->samplesPerSec = (SLuint32)sampleRate * 1000;
 
     switch(sampleFormat)
     {
@@ -381,57 +401,77 @@ static int BuildSLDataFormat(SLDataFormat_PCM *slFormat, int numChannels, PaSamp
     case paFloat32:
     case paCustomFormat:
     default:
-        return 0;
+        return FALSE;
     }
     
     slFormat->containerSize = slFormat->bitsPerSample;
-    slFormat->channelMask   = SL_SPEAKER_FRONT_CENTER;
+
+    // Channels
+    slFormat->numChannels   = (SLuint32)numChannels;
+    if(numChannels==1)
+        slFormat->channelMask   = SL_SPEAKER_FRONT_CENTER;
+    else if(numChannels==2)
+        slFormat->channelMask   = SL_SPEAKER_FRONT_LEFT | SL_SPEAKER_FRONT_RIGHT;
+    else
+        return FALSE; // Unsupported channel configuration
+
 #ifdef PA_LITTLE_ENDIAN
     slFormat->endianness    = SL_BYTEORDER_LITTLEENDIAN;
 #else
     slFormat->endianness    = SL_BYTEORDER_BIGENDIAN;
 #endif
 
-    return 1;
+    return TRUE;
 }
 
 
-
-static int CheckOutputFormat(SLEngineItf engine, SLObjectItf mix, int numChannels, PaSampleFormat sampleFormat, double sampleRate )
+// Create or Check AudioPlayer availability for the given stream format
+// if playerObject is NULL, just just the availability, otherwise create and
+// return the AudioPlayer instance
+static int CreateAudioPlayer(SLObjectItf *playerObject, SLEngineItf engine, SLObjectItf mix, int numChannels, PaSampleFormat sampleFormat, double sampleRate )
 {
-    // configure audio source
+    // Configure audio source
     SLDataLocator_AndroidSimpleBufferQueue loc_bufq = {SL_DATALOCATOR_ANDROIDSIMPLEBUFFERQUEUE, 2};
     SLDataFormat_PCM format_pcm;
+
+    // Validate and convert format
     if(!BuildSLDataFormat(&format_pcm, numChannels, sampleFormat, sampleRate))
-        return 0;
+        return FALSE;
 
     SLDataSource audioSrc = {&loc_bufq, &format_pcm};
 
-    // configure audio sink
+    // Configure audio sink
     SLDataLocator_OutputMix loc_outmix = {SL_DATALOCATOR_OUTPUTMIX, mix};
     SLDataSink audioSnk = {&loc_outmix, NULL};
 
-    // create audio player
+    // Create audio player
     const SLInterfaceID ids[1] = {SL_IID_BUFFERQUEUE};
     const SLboolean req[1] = {SL_BOOLEAN_TRUE};
 
     SLObjectItf bqPlayerObject = NULL;
 
-    int created = 0;
+    int created = FALSE;
+    SLresult result = (*engine)->CreateAudioPlayer(engine, &bqPlayerObject, &audioSrc, &audioSnk, 1, ids, req);
 
-    if(SL_RESULT_SUCCESS == (*engine)->CreateAudioPlayer(engine, &bqPlayerObject, &audioSrc, &audioSnk, 3, ids, req))
+    if(SL_RESULT_SUCCESS==result)
     {
-        // realize the player
-        if(SL_RESULT_SUCCESS == (*bqPlayerObject)->Realize(bqPlayerObject, SL_BOOLEAN_FALSE))
-            created = 1;
+        // realize the player.
+        result = (*bqPlayerObject)->Realize(bqPlayerObject, SL_BOOLEAN_FALSE);
+        created = SL_RESULT_SUCCESS==result;
     }
     
-    if (bqPlayerObject != NULL)
-        (*bqPlayerObject)->Destroy(bqPlayerObject);
+    // If we don't have a player pointer, the user is just checking requirements
+    if( !playerObject )
+    {
+        // Destroy the instance if available
+        if( bqPlayerObject )
+            (*bqPlayerObject)->Destroy( bqPlayerObject );
+    }
+    else // Return the created object to the user
+        *playerObject = bqPlayerObject;
 
     return created;
 }
-
 
 
 
@@ -444,10 +484,13 @@ static PaError IsFormatSupported( struct PaUtilHostApiRepresentation *hostApi,
     int inputChannelCount, outputChannelCount;
     PaSampleFormat inputSampleFormat, outputSampleFormat;
     
+
     if( inputParameters )
     {
         inputChannelCount = inputParameters->channelCount;
         inputSampleFormat = inputParameters->sampleFormat;
+        
+        LOG("IsFormatSupported Input Chan:%d Fmt:%d Rate:%lf",inputChannelCount, inputSampleFormat, sampleRate);
 
         /* all standard sample formats are supported by the buffer adapter,
             this implementation doesn't support any custom sample formats */
@@ -477,6 +520,8 @@ static PaError IsFormatSupported( struct PaUtilHostApiRepresentation *hostApi,
     {
         outputChannelCount = outputParameters->channelCount;
         outputSampleFormat = outputParameters->sampleFormat;
+        
+        LOG("IsFormatSupported Output Chan:%d Fmt:%d Rate:%lf", outputChannelCount, outputSampleFormat, sampleRate);
 
         /* all standard sample formats are supported by the buffer adapter,
             this implementation doesn't support any custom sample formats */
@@ -497,7 +542,7 @@ static PaError IsFormatSupported( struct PaUtilHostApiRepresentation *hostApi,
         if( outputParameters->hostApiSpecificStreamInfo )
             return paIncompatibleHostApiSpecificStreamInfo; /* this implementation doesn't use custom stream info */
 
-        if(!CheckOutputFormat(oslesHostApi->engineEngine, oslesHostApi->outputMixObject, outputChannelCount, outputSampleFormat, sampleRate ))
+        if(!CreateAudioPlayer(NULL, oslesHostApi->engineEngine, oslesHostApi->outputMixObject, outputChannelCount, outputSampleFormat, sampleRate ))
             return paSampleFormatNotSupported;
     }
     else
@@ -533,6 +578,8 @@ static PaError IsFormatSupported( struct PaUtilHostApiRepresentation *hostApi,
     return paFormatIsSupported;
 }
 
+
+
 /* PaOpenSLESStream - a stream data structure specifically for this implementation */
 
 typedef struct PaOpenSLESStream
@@ -545,8 +592,31 @@ typedef struct PaOpenSLESStream
             - implementation specific data goes here
     */
     unsigned long framesPerHostCallback; /* just an example */
+    SLObjectItf audioPlayer;
+    SLPlayItf audioPlayerPlay;
+    SLAndroidSimpleBufferQueueItf playerBufferQueue;
 }
 PaOpenSLESStream;
+
+
+// this callback handler is called every time a buffer finishes playing
+static void bqPlayerCallback(SLAndroidSimpleBufferQueueItf bq, void *context)
+{
+    PaOpenSLESStream *stream = (PaOpenSLESStream*)context;
+    CHECK(stream);
+/*    assert(bq == bqPlayerBufferQueue);
+    assert(NULL == context);
+    // for streaming playback, replace this test by logic to find and fill the next buffer
+    if (--nextCount > 0 && NULL != nextBuffer && 0 != nextSize) {
+        SLresult result;
+        // enqueue another buffer
+        result = (*bqPlayerBufferQueue)->Enqueue(bqPlayerBufferQueue, nextBuffer, nextSize);
+        // the most likely other result is SL_RESULT_BUFFER_INSUFFICIENT,
+        // which for this code example would indicate a programming error
+        assert(SL_RESULT_SUCCESS == result);
+    }*/
+}
+
 
 /* see pa_hostapi.h for a list of validity guarantees made about OpenStream parameters */
 
@@ -567,6 +637,7 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
     int inputChannelCount, outputChannelCount;
     PaSampleFormat inputSampleFormat, outputSampleFormat;
     PaSampleFormat hostInputSampleFormat, hostOutputSampleFormat;
+    SLObjectItf audioPlayer;
 
 
     if( inputParameters )
@@ -618,8 +689,12 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
             return paIncompatibleHostApiSpecificStreamInfo; /* this implementation doesn't use custom stream info */
 
         /* IMPLEMENT ME - establish which  host formats are available */
-        hostOutputSampleFormat =
-            PaUtil_SelectClosestAvailableFormat( paInt16 /* native formats */, outputSampleFormat );
+//        hostOutputSampleFormat =
+//            PaUtil_SelectClosestAvailableFormat( paInt16 /* native formats */, outputSampleFormat ); 
+        
+        if(!CreateAudioPlayer(&audioPlayer, oslesHostApi->engineEngine, oslesHostApi->outputMixObject, outputChannelCount, outputSampleFormat, sampleRate ))
+            return paSampleFormatNotSupported;
+        hostOutputSampleFormat = outputSampleFormat;
     }
     else
     {
@@ -705,19 +780,41 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
             (PaTime)PaUtil_GetBufferProcessorOutputLatencyFrames(&stream->bufferProcessor) / sampleRate; /* outputLatency is specified in _seconds_ */
     stream->streamRepresentation.streamInfo.sampleRate = sampleRate;
 
-    
     /*
         IMPLEMENT ME:
             - additional stream setup + opening
     */
 
     stream->framesPerHostCallback = framesPerHostBuffer;
+    stream->audioPlayer = audioPlayer;
+    
+    if(audioPlayer)
+    {
+        // get the play interface
+        result = (*audioPlayer)->GetInterface( audioPlayer, SL_IID_PLAY, &stream->audioPlayerPlay );
+        if(SL_RESULT_SUCCESS != result)
+            goto error;
+
+        // get the buffer queue interface
+        result = (*audioPlayer)->GetInterface( audioPlayer, SL_IID_BUFFERQUEUE, &stream->playerBufferQueue );
+        if(SL_RESULT_SUCCESS != result)
+            goto error;
+
+        // register callback on the buffer queue
+        result = (*stream->playerBufferQueue)->RegisterCallback( stream->playerBufferQueue, bqPlayerCallback, stream );
+        if(SL_RESULT_SUCCESS != result)
+            goto error;
+    }
+
 
     *s = (PaStream*)stream;
 
     return result;
 
 error:
+    if( audioPlayer )
+        (*audioPlayer)->Destroy( audioPlayer );
+
     if( stream )
         PaUtil_FreeMemory( stream );
 
