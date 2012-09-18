@@ -595,6 +595,8 @@ typedef struct PaOpenSLESStream
     SLObjectItf audioPlayer;
     SLPlayItf audioPlayerPlay;
     SLAndroidSimpleBufferQueueItf playerBufferQueue;
+    void *playerBuffer;     // A DoubleBuffer (not yet)
+    size_t playerBufferSize;
 }
 PaOpenSLESStream;
 
@@ -615,6 +617,16 @@ static void bqPlayerCallback(SLAndroidSimpleBufferQueueItf bq, void *context)
         // which for this code example would indicate a programming error
         assert(SL_RESULT_SUCCESS == result);
     }*/
+
+    CHECK(stream->playerBuffer);
+	CHECK(stream->playerBufferSize>0);
+	SLresult result;
+	// enqueue another buffer
+	result = (*stream->playerBufferQueue)->Enqueue(stream->playerBufferQueue, stream->playerBuffer, stream->playerBufferSize);
+	// the most likely other result is SL_RESULT_BUFFER_INSUFFICIENT,
+	// which for this code example would indicate a programming error
+	CHECK(SL_RESULT_SUCCESS == result);
+    
 }
 
 
@@ -637,9 +649,10 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
     int inputChannelCount, outputChannelCount;
     PaSampleFormat inputSampleFormat, outputSampleFormat;
     PaSampleFormat hostInputSampleFormat, hostOutputSampleFormat;
-    SLObjectItf audioPlayer;
+    SLObjectItf audioPlayer = 0;
 
 
+#if 0 // We don't support audio input for now    
     if( inputParameters )
     {
         inputChannelCount = inputParameters->channelCount;
@@ -664,6 +677,7 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
             PaUtil_SelectClosestAvailableFormat( paInt16 /* native formats */, inputSampleFormat );
     }
     else
+#endif        
     {
         inputChannelCount = 0;
         inputSampleFormat = hostInputSampleFormat = paInt16; /* Surpress 'uninitialised var' warnings. */
@@ -726,7 +740,9 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
                 use default values where necessary
     */
 
-
+    /* KK abort if no valid number of channels selected */
+    if( inputChannelCount == 0 && outputChannelCount == 0 )
+        return paInvalidChannelCount;
 
 
     /* validate platform specific flags */
@@ -740,6 +756,9 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
         result = paInsufficientMemory;
         goto error;
     }
+
+    memset(stream, 0, sizeof(PaOpenSLESStream));
+
 
     if( streamCallback )
     {
@@ -787,9 +806,20 @@ static PaError OpenStream( struct PaUtilHostApiRepresentation *hostApi,
 
     stream->framesPerHostCallback = framesPerHostBuffer;
     stream->audioPlayer = audioPlayer;
-    
+
     if(audioPlayer)
     {
+        /* Allocate buffer */
+        stream->playerBufferSize = framesPerBuffer * Pa_GetSampleSize(outputSampleFormat);
+        stream->playerBuffer = PaUtil_AllocateMemory(stream->playerBufferSize);
+        if(!stream->playerBuffer)
+        {
+            result = paInsufficientMemory;
+            goto error;
+        }
+
+        memset( stream->playerBuffer, 0, stream->playerBufferSize);
+
         // get the play interface
         result = (*audioPlayer)->GetInterface( audioPlayer, SL_IID_PLAY, &stream->audioPlayerPlay );
         if(SL_RESULT_SUCCESS != result)
@@ -816,7 +846,12 @@ error:
         (*audioPlayer)->Destroy( audioPlayer );
 
     if( stream )
+    {
+        if( stream->playerBuffer )
+            free( stream->playerBuffer );
+
         PaUtil_FreeMemory( stream );
+    }
 
     return result;
 }
